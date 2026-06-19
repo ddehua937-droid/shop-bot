@@ -34,14 +34,17 @@ REQUIRED_GROUP_ID   = os.getenv("REQUIRED_GROUP_ID", "")     # 指定群的 chat
 REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "")   # 指定群的邀请链接，提示用户加入时使用
 REQUIRED_GROUP_NAME = os.getenv("REQUIRED_GROUP_NAME", "指定群组")
 
-PAGE_SIZE             = 6
-DELETE_AFTER          = 300   # 群里消息5分钟后自动删除
-REFRESH_SECONDS       = 300   # 后台自动刷新表格间隔（5分钟）
-MIN_REFRESH_GAP       = 20    # /refresh 手动刷新最小间隔（秒）
-CAPTION_LIMIT         = 1024  # Telegram 图片说明文字上限
-MEMBERSHIP_CACHE_TTL  = 300   # 成员资格检查结果缓存时间（秒），避免频繁调用接口
+PAGE_SIZE        = 6
+DELETE_AFTER     = 300   # 群里消息5分钟后自动删除
+REFRESH_SECONDS  = 300   # 后台自动刷新表格间隔（5分钟）
+MIN_REFRESH_GAP  = 20    # /refresh 手动刷新最小间隔（秒）
+CAPTION_LIMIT    = 1024  # Telegram 图片说明文字上限
+
+# 成员资格缓存：只缓存「是成员」的结果，避免用户加群后还要等缓存过期才能用
+MEMBERSHIP_CACHE_TTL = 300  # 秒
 
 TRUE_VALUES = {"是", "yes", "true", "1", "y", "✓", "√"}
+MEMBER_STATUSES = {"creator", "administrator", "member", "restricted"}
 
 
 def _csv_url(gid: str) -> str:
@@ -148,25 +151,31 @@ async def safe_edit(query, text, reply_markup=None):
 
 
 # ── 成员资格门禁 ───────────────────────────────────
-_membership_cache = {}  # {user_id: (is_member: bool, checked_at: float)}
+_membership_cache = {}  # {user_id: checked_at}  —— 只记「是成员」，不记「不是成员」
 
 
 async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
     if not REQUIRED_GROUP_ID:
         return True  # 未配置限制，所有人都能用
 
-    cached = _membership_cache.get(user_id)
-    if cached and (time.time() - cached[1] < MEMBERSHIP_CACHE_TTL):
-        return cached[0]
+    # 只信任「是成员」的缓存结果；「不是成员」从不缓存，
+    # 确保用户加群后，下一次操作立刻能用，不用等缓存过期
+    checked_at = _membership_cache.get(user_id)
+    if checked_at and (time.time() - checked_at < MEMBERSHIP_CACHE_TTL):
+        return True
 
     try:
         member = await context.bot.get_chat_member(chat_id=REQUIRED_GROUP_ID, user_id=user_id)
-        is_member = member.status in ("member", "administrator", "creator")
+        is_member = member.status in MEMBER_STATUSES
     except Exception as e:
-        print(f"[ERROR] 成员资格检查失败 user_id={user_id}: {e}")
-        is_member = False
+        print(f"[WARN] 群成员检查失败 user_id={user_id}: {e}")
+        is_member = False  # 检查失败（如机器人不在该群、ID填错）时，保守拒绝
 
-    _membership_cache[user_id] = (is_member, time.time())
+    if is_member:
+        _membership_cache[user_id] = time.time()
+    else:
+        _membership_cache.pop(user_id, None)
+
     return is_member
 
 
@@ -488,6 +497,8 @@ def main():
     )
 
     print("✅ 机器人启动成功")
+    if REQUIRED_GROUP_ID:
+        print(f"🔒 已启用群成员门槛，要求加入: {REQUIRED_GROUP_ID}")
     app.run_polling()
 
 

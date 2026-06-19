@@ -35,6 +35,8 @@ REFRESH_SECONDS  = 300   # 后台自动刷新表格间隔（5分钟）
 MIN_REFRESH_GAP  = 20    # /refresh 手动刷新最小间隔（秒）
 CAPTION_LIMIT    = 1024  # Telegram 图片说明文字上限
 
+TRUE_VALUES = {"是", "yes", "true", "1", "y", "✓", "√"}
+
 
 def _csv_url(gid: str) -> str:
     return f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={gid}"
@@ -45,7 +47,7 @@ class DataStore:
     def __init__(self):
         self.categories = []        # ["🛍️ 购物百货", "📦 快递包裹", ...] 顺序=表格首次出现顺序
         self.merchants_by_cat = {}  # {cat_idx: [{"name":.., "contact":.., "image":..}, ...]}
-        self.buttons = []           # [{"label":.., "reply":..}, ...]
+        self.buttons = []           # [{"label":.., "reply":.., "group_only":bool}, ...]
         self.last_refresh = 0
         self.last_error = None
 
@@ -81,8 +83,14 @@ class DataStore:
                 for row in csv.DictReader(io.StringIO(resp2.text)):
                     label = (row.get("按钮文字") or "").strip()
                     reply = (row.get("回复内容") or "").strip()
+                    group_only_raw = (row.get("仅群聊") or "").strip()
+                    group_only = group_only_raw in TRUE_VALUES
                     if label:
-                        new_buttons.append({"label": label, "reply": reply or "暂无内容"})
+                        new_buttons.append({
+                            "label": label,
+                            "reply": reply or "暂无内容",
+                            "group_only": group_only
+                        })
 
             self.categories = new_categories
             self.merchants_by_cat = new_merchants
@@ -173,7 +181,7 @@ async def render(query, context, text, reply_markup=None, photo_url=None):
 
 
 # ── 键盘构建（全部来自 store）──────────────────────
-def reply_menu() -> ReplyKeyboardMarkup:
+def reply_menu(is_group_chat: bool) -> ReplyKeyboardMarkup:
     rows, row = [], []
     for cat in store.categories:
         row.append(cat)
@@ -182,6 +190,8 @@ def reply_menu() -> ReplyKeyboardMarkup:
     if row:
         rows.append(row); row = []
     for b in store.buttons:
+        if b.get("group_only") and not is_group_chat:
+            continue
         row.append(b["label"])
         if len(row) == 2:
             rows.append(row); row = []
@@ -245,7 +255,7 @@ def detail_keyboard(cat_idx: int, page: int) -> InlineKeyboardMarkup:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
         "📢 功能导航，请选择👇",
-        reply_markup=reply_menu()
+        reply_markup=reply_menu(is_group(update))
     )
     if is_group(update):
         schedule_delete(context, msg.chat_id, msg.message_id)
@@ -270,6 +280,7 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ── 底部键盘处理 ───────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
+    in_group = is_group(update)
 
     if text in store.categories:
         cat_idx = store.categories.index(text)
@@ -277,14 +288,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{text}，点击查看详情👇",
             reply_markup=merchant_keyboard(cat_idx, 0)
         )
-        if is_group(update):
+        if in_group:
             schedule_delete(context, msg.chat_id, msg.message_id)
         return
 
     for b in store.buttons:
+        if b.get("group_only") and not in_group:
+            continue
         if text == b["label"]:
             msg = await update.message.reply_text(b["reply"])
-            if is_group(update):
+            if in_group:
                 schedule_delete(context, msg.chat_id, msg.message_id)
             return
 

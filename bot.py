@@ -5,6 +5,7 @@ import math
 import os
 import time
 import traceback
+from datetime import datetime, timezone, timedelta
 
 import requests
 from telegram import (
@@ -33,6 +34,16 @@ BUTTONS_GID   = os.getenv("BUTTONS_GID", "")      # "按钮" 工作表的 gid，
 REQUIRED_GROUP_ID   = os.getenv("REQUIRED_GROUP_ID", "")     # 指定群的 chat_id，例如 -1001234567890
 REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "")   # 指定群的邀请链接，提示用户加入时使用
 REQUIRED_GROUP_NAME = os.getenv("REQUIRED_GROUP_NAME", "指定群组")
+
+# 使用统计：留空则不启用，/stats 会提示未配置
+USAGE_LOG_URL = os.getenv("USAGE_LOG_URL", "")  # Google Apps Script Web App 网址
+
+# /stats 只允许这些用户使用，逗号分隔多个，例如 "123456789,987654321"
+ADMIN_USER_IDS = {
+    uid.strip() for uid in os.getenv("ADMIN_USER_IDS", "").split(",") if uid.strip()
+}
+
+ARMENIA_TZ = timezone(timedelta(hours=4))  # 用于「今天」的日期判断
 
 PAGE_SIZE        = 6
 DELETE_AFTER     = 300   # 群里消息5分钟后自动删除
@@ -189,6 +200,43 @@ def join_required_text() -> str:
     return text
 
 
+# ── 使用统计上报 ───────────────────────────────────
+_logged_today = {}  # {user_id: "YYYY-MM-DD"} —— 同一进程内每人每天只上报一次
+
+
+async def log_usage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not USAGE_LOG_URL:
+        return
+    user = update.effective_user
+    if not user:
+        return
+
+    now = datetime.now(ARMENIA_TZ)
+    today_str = now.strftime("%Y-%m-%d")
+
+    if _logged_today.get(user.id) == today_str:
+        return  # 这个进程里今天已经上报过，不重复
+    _logged_today[user.id] = today_str
+
+    username = user.username or user.full_name or ""
+    source = "群聊" if is_group(update) else "私聊"
+    try:
+        await asyncio.to_thread(
+            requests.post,
+            USAGE_LOG_URL,
+            json={
+                "date": today_str,
+                "user_id": str(user.id),
+                "username": username,
+                "source": source,
+                "time": now.strftime("%H:%M:%S"),
+            },
+            timeout=10
+        )
+    except Exception as e:
+        print(f"[WARN] 使用记录上报失败 user_id={user.id}: {e}")
+
+
 # ── 统一渲染：自动处理 文字⇄图片 之间的切换 ──────────
 async def render(query, context, text, reply_markup=None, photo_url=None):
     """
@@ -320,6 +368,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(join_required_text())
         return
 
+    await log_usage(update, context)
+
     in_group = is_group(update)
     greeting = "📢 欢迎，点击下方按钮👇" if in_group else "📢 功能导航，请选择👇"
     msg = await update.message.reply_text(
@@ -335,6 +385,35 @@ async def groupid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     await update.message.reply_text(
         f"当前会话 ID：{chat.id}\n类型：{chat.type}"
+    )
+
+
+# ── /stats（查看使用统计，仅限管理员）─────────────────
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    if ADMIN_USER_IDS and user_id not in ADMIN_USER_IDS:
+        await update.message.reply_text("⛔ 该指令仅限管理员使用")
+        return
+
+    if not USAGE_LOG_URL:
+        await update.message.reply_text("⚠️ 还没配置使用统计功能（缺少 USAGE_LOG_URL）")
+        return
+
+    today_str = datetime.now(ARMENIA_TZ).strftime("%Y-%m-%d")
+    try:
+        resp = await asyncio.to_thread(
+            requests.get, USAGE_LOG_URL, params={"date": today_str}, timeout=15
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        await update.message.reply_text(f"❌ 读取统计数据失败：{e}")
+        return
+
+    await update.message.reply_text(
+        f"📊 使用统计\n\n"
+        f"今天（{today_str}）使用人数：{data.get('today_count', '?')} 人\n"
+        f"累计使用人数：{data.get('total_count', '?')} 人"
     )
 
 
@@ -361,6 +440,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_membership(user_id, context):
         await update.message.reply_text(join_required_text())
         return
+
+    await log_usage(update, context)
 
     text = update.message.text
     in_group = is_group(update)
@@ -396,6 +477,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_membership(user_id, context):
         await query.answer("🔒 请先加入指定群组才能使用", show_alert=True)
         return
+
+    await log_usage(update, context)
 
     try:
         if data == "noop":
@@ -487,6 +570,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
     app.add_handler(CommandHandler("groupid", groupid_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_handler))
 

@@ -83,7 +83,7 @@ class DataStore:
                 for row in csv.DictReader(io.StringIO(resp2.text)):
                     label = (row.get("按钮文字") or "").strip()
                     reply = (row.get("回复内容") or "").strip()
-                    group_only_raw = (row.get("仅群聊") or "").strip()
+                    group_only_raw = (row.get("仅群聊") or "").strip().lower()
                     group_only = group_only_raw in TRUE_VALUES
                     if label:
                         new_buttons.append({
@@ -181,22 +181,36 @@ async def render(query, context, text, reply_markup=None, photo_url=None):
 
 
 # ── 键盘构建（全部来自 store）──────────────────────
+# 群聊：只显示「仅群聊」按钮（分类、普通按钮一律不显示）
+# 私聊：显示分类 + 非「仅群聊」按钮
 def reply_menu(is_group_chat: bool) -> ReplyKeyboardMarkup:
     rows, row = [], []
-    for cat in store.categories:
-        row.append(cat)
-        if len(row) == 2:
+
+    if is_group_chat:
+        for b in store.buttons:
+            if not b.get("group_only"):
+                continue
+            row.append(b["label"])
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+    else:
+        for cat in store.categories:
+            row.append(cat)
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
             rows.append(row); row = []
-    if row:
-        rows.append(row); row = []
-    for b in store.buttons:
-        if b.get("group_only") and not is_group_chat:
-            continue
-        row.append(b["label"])
-        if len(row) == 2:
-            rows.append(row); row = []
-    if row:
-        rows.append(row)
+        for b in store.buttons:
+            if b.get("group_only"):
+                continue
+            row.append(b["label"])
+            if len(row) == 2:
+                rows.append(row); row = []
+        if row:
+            rows.append(row)
+
     if not rows:
         rows = [["⏳ 数据加载中，请稍后"]]
     return ReplyKeyboardMarkup(rows, resize_keyboard=True)
@@ -253,11 +267,13 @@ def detail_keyboard(cat_idx: int, page: int) -> InlineKeyboardMarkup:
 
 # ── /start ─────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    in_group = is_group(update)
+    greeting = "📢 欢迎，点击下方按钮👇" if in_group else "📢 功能导航，请选择👇"
     msg = await update.message.reply_text(
-        "📢 功能导航，请选择👇",
-        reply_markup=reply_menu(is_group(update))
+        greeting,
+        reply_markup=reply_menu(in_group)
     )
-    if is_group(update):
+    if in_group:
         schedule_delete(context, msg.chat_id, msg.message_id)
 
 
@@ -271,7 +287,8 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if ok:
         total = sum(len(v) for v in store.merchants_by_cat.values())
         await update.message.reply_text(
-            f"✅ 已刷新：{len(store.categories)}个分类，{total}个商家"
+            f"✅ 已刷新：{len(store.categories)}个分类，"
+            f"{total}个商家，{len(store.buttons)}个按钮"
         )
     else:
         await update.message.reply_text(f"❌ 刷新失败：{store.last_error}")
@@ -282,18 +299,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     in_group = is_group(update)
 
-    if text in store.categories:
+    # 分类菜单只在私聊可用
+    if not in_group and text in store.categories:
         cat_idx = store.categories.index(text)
-        msg = await update.message.reply_text(
+        await update.message.reply_text(
             f"{text}，点击查看详情👇",
             reply_markup=merchant_keyboard(cat_idx, 0)
         )
-        if in_group:
-            schedule_delete(context, msg.chat_id, msg.message_id)
         return
 
     for b in store.buttons:
-        if b.get("group_only") and not in_group:
+        g_only = b.get("group_only")
+        if in_group and not g_only:
+            continue
+        if not in_group and g_only:
             continue
         if text == b["label"]:
             msg = await update.message.reply_text(b["reply"])

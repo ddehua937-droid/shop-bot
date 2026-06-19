@@ -29,11 +29,17 @@ SHEET_ID      = os.getenv("SHEET_ID")
 MERCHANTS_GID = os.getenv("MERCHANTS_GID", "0")   # "商家" 工作表的 gid
 BUTTONS_GID   = os.getenv("BUTTONS_GID", "")      # "按钮" 工作表的 gid，留空则不启用
 
-PAGE_SIZE        = 6
-DELETE_AFTER     = 300   # 群里消息5分钟后自动删除
-REFRESH_SECONDS  = 300   # 后台自动刷新表格间隔（5分钟）
-MIN_REFRESH_GAP  = 20    # /refresh 手动刷新最小间隔（秒）
-CAPTION_LIMIT    = 1024  # Telegram 图片说明文字上限
+# 访问限制：只有加了指定群的用户才能用机器人。留空 REQUIRED_GROUP_ID 则不限制任何人
+REQUIRED_GROUP_ID   = os.getenv("REQUIRED_GROUP_ID", "")     # 指定群的 chat_id，例如 -1001234567890
+REQUIRED_GROUP_LINK = os.getenv("REQUIRED_GROUP_LINK", "")   # 指定群的邀请链接，提示用户加入时使用
+REQUIRED_GROUP_NAME = os.getenv("REQUIRED_GROUP_NAME", "指定群组")
+
+PAGE_SIZE             = 6
+DELETE_AFTER          = 300   # 群里消息5分钟后自动删除
+REFRESH_SECONDS       = 300   # 后台自动刷新表格间隔（5分钟）
+MIN_REFRESH_GAP       = 20    # /refresh 手动刷新最小间隔（秒）
+CAPTION_LIMIT         = 1024  # Telegram 图片说明文字上限
+MEMBERSHIP_CACHE_TTL  = 300   # 成员资格检查结果缓存时间（秒），避免频繁调用接口
 
 TRUE_VALUES = {"是", "yes", "true", "1", "y", "✓", "√"}
 
@@ -139,6 +145,39 @@ async def safe_edit(query, text, reply_markup=None):
     except BadRequest as e:
         if "Message is not modified" not in str(e):
             raise
+
+
+# ── 成员资格门禁 ───────────────────────────────────
+_membership_cache = {}  # {user_id: (is_member: bool, checked_at: float)}
+
+
+async def check_membership(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not REQUIRED_GROUP_ID:
+        return True  # 未配置限制，所有人都能用
+
+    cached = _membership_cache.get(user_id)
+    if cached and (time.time() - cached[1] < MEMBERSHIP_CACHE_TTL):
+        return cached[0]
+
+    try:
+        member = await context.bot.get_chat_member(chat_id=REQUIRED_GROUP_ID, user_id=user_id)
+        is_member = member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        print(f"[ERROR] 成员资格检查失败 user_id={user_id}: {e}")
+        is_member = False
+
+    _membership_cache[user_id] = (is_member, time.time())
+    return is_member
+
+
+def join_required_text() -> str:
+    text = f"🔒 本机器人仅限「{REQUIRED_GROUP_NAME}」成员使用\n\n"
+    if REQUIRED_GROUP_LINK:
+        text += f"请先加入：{REQUIRED_GROUP_LINK}\n\n"
+    else:
+        text += "请先加入指定群组\n\n"
+    text += "加入后重新发送 /start 即可使用"
+    return text
 
 
 # ── 统一渲染：自动处理 文字⇄图片 之间的切换 ──────────
@@ -267,6 +306,11 @@ def detail_keyboard(cat_idx: int, page: int) -> InlineKeyboardMarkup:
 
 # ── /start ─────────────────────────────────────────
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await check_membership(user_id, context):
+        await update.message.reply_text(join_required_text())
+        return
+
     in_group = is_group(update)
     greeting = "📢 欢迎，点击下方按钮👇" if in_group else "📢 功能导航，请选择👇"
     msg = await update.message.reply_text(
@@ -275,6 +319,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     if in_group:
         schedule_delete(context, msg.chat_id, msg.message_id)
+
+
+# ── /groupid（查看当前会话ID，方便配置 REQUIRED_GROUP_ID）──
+async def groupid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    await update.message.reply_text(
+        f"当前会话 ID：{chat.id}\n类型：{chat.type}"
+    )
 
 
 # ── /refresh（手动刷新表格）─────────────────────────
@@ -296,6 +348,11 @@ async def refresh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ── 底部键盘处理 ───────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not await check_membership(user_id, context):
+        await update.message.reply_text(join_required_text())
+        return
+
     text = update.message.text
     in_group = is_group(update)
 
@@ -325,6 +382,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     data = query.data
+
+    user_id = query.from_user.id
+    if not await check_membership(user_id, context):
+        await query.answer("🔒 请先加入指定群组才能使用", show_alert=True)
+        return
 
     try:
         if data == "noop":
@@ -415,6 +477,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("refresh", refresh_cmd))
+    app.add_handler(CommandHandler("groupid", groupid_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(CallbackQueryHandler(button_handler))
 
